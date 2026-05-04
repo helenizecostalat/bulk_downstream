@@ -833,6 +833,163 @@ dig_results <- dig_results %>%
 DIGs <- dig_results %>% filter(padj < 0.05)
 
 head(DIGs, 10)
+
+# Boxplots para top DIGs
+top_genes <- DIGs %>%
+  arrange(padj) %>%
+  slice_head(n = 6) %>%
+  pull(gene)
+
+if (length(top_genes) > 0) {
+  gene_labels <- dig_results %>%
+    dplyr::filter(gene %in% top_genes) %>%
+    mutate(gene_label = ifelse(is.na(gene_symbol) | gene_symbol == "", gene, gene_symbol)) %>%
+    distinct(gene, gene_label)
+
+  plot_tbl <- as.data.frame(t(deg_mat_sub[top_genes, , drop = FALSE])) %>%
+    rownames_to_column("sample") %>%
+    pivot_longer(cols = -sample, names_to = "gene", values_to = "degree") %>%
+    left_join(dig_meta %>% dplyr::select(sample, space), by = "sample") %>%
+    left_join(gene_labels, by = "gene")
+
+  p_digs <- ggplot(plot_tbl, aes(x = space, y = degree, fill = space)) +
+    geom_boxplot(outlier.size = 0.6) +
+    geom_jitter(width = 0.1, size = 0.8, alpha = 0.6) +
+    facet_wrap(~ gene_label, scales = "free_y") +
+    theme_bw() +
+    labs(title = "Top DIGs: conectividade por grupo", x = NULL, y = "Grau")
+
+  p_digs
+}
+```
+
+```{r lioness-ssgsea}
+library(GSVA)
+library(msigdbr)
+
+# ssGSEA com Hallmark e regressao com conectividade media
+hallmark_tbl <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  dplyr::select(gs_name, gene_symbol)
+
+hallmark_list <- split(hallmark_tbl$gene_symbol, hallmark_tbl$gs_name)
+
+gene_symbols <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = rownames(normalized_counts),
+  columns = c("ENSEMBL", "SYMBOL"),
+  keytype = "ENSEMBL"
+)
+
+expr_sym_tbl <- normalized_counts %>%
+  as.data.frame() %>%
+  rownames_to_column("gene") %>%
+  left_join(gene_symbols, by = c("gene" = "ENSEMBL")) %>%
+  filter(!is.na(SYMBOL) & SYMBOL != "") %>%
+  group_by(SYMBOL) %>%
+  summarise(across(where(is.numeric), mean), .groups = "drop")
+
+expr_sym_mat <- expr_sym_tbl %>%
+  column_to_rownames("SYMBOL") %>%
+  as.matrix()
+
+if (exists("ssgseaParam")) {
+  param_names <- names(formals(ssgseaParam))
+  if ("geneSets" %in% param_names) {
+    ssgsea_params <- ssgseaParam(
+      expr = expr_sym_mat,
+      geneSets = hallmark_list
+    )
+  } else {
+    ssgsea_params <- ssgseaParam(
+      expr = expr_sym_mat,
+      gset.idx.list = hallmark_list
+    )
+  }
+  ssgsea_mat <- gsva(ssgsea_params)
+} else {
+  ssgsea_mat <- gsva(expr_sym_mat, hallmark_list, method = "ssgsea", kcdf = "Gaussian")
+}
+
+conn_vec <- colMeans(deg_mat_sub, na.rm = TRUE)
+conn_tbl <- data.frame(sample = names(conn_vec), connectivity = conn_vec) %>%
+  left_join(dig_meta %>% select(sample, space), by = "sample")
+
+ssgsea_sub <- ssgsea_mat[, conn_tbl$sample, drop = FALSE]
+
+reg_results <- lapply(rownames(ssgsea_sub), function(gs) {
+  df <- conn_tbl
+  df$score <- as.numeric(ssgsea_sub[gs, ])
+  fit <- lm(connectivity ~ score + space, data = df)
+  coef_tbl <- summary(fit)$coefficients
+
+  data.frame(
+    geneset = gs,
+    beta_score = coef_tbl["score", "Estimate"],
+    p_score = coef_tbl["score", "Pr(>|t|)"],
+    stringsAsFactors = FALSE
+  )
+})
+
+reg_tbl <- bind_rows(reg_results) %>%
+  mutate(padj = p.adjust(p_score, method = "BH")) %>%
+  arrange(padj)
+
+head(reg_tbl, 10)
+
+# Regressao: ssGSEA vs conectividade do gene OGN por amostra
+ogn_map <- gene_symbols %>% filter(SYMBOL == "OGN") %>% pull(ENSEMBL)
+ogn_map <- ogn_map[!is.na(ogn_map)]
+
+if (length(ogn_map) > 0 && ogn_map[1] %in% rownames(deg_mat_sub)) {
+  ogn_conn <- as.numeric(deg_mat_sub[ogn_map[1], conn_tbl$sample])
+
+  top_sets <- reg_tbl %>%
+    slice_head(n = 6) %>%
+    pull(geneset)
+
+  plot_ssgsea_tbl <- data.frame(
+    sample = conn_tbl$sample,
+    space = conn_tbl$space,
+    ogn_conn = ogn_conn
+  )
+
+  plot_long <- lapply(top_sets, function(gs) {
+    data.frame(
+      sample = plot_ssgsea_tbl$sample,
+      space = plot_ssgsea_tbl$space,
+      ogn_conn = plot_ssgsea_tbl$ogn_conn,
+      geneset = gs,
+      ssgsea = as.numeric(ssgsea_sub[gs, plot_ssgsea_tbl$sample])
+    )
+  }) %>%
+    bind_rows()
+
+  stats_tbl <- plot_long %>%
+    group_by(geneset) %>%
+    summarise(
+      r2 = summary(lm(ssgsea ~ ogn_conn))$r.squared,
+      p_val = summary(lm(ssgsea ~ ogn_conn))$coefficients["ogn_conn", "Pr(>|t|)"],
+      .groups = "drop"
+    ) %>%
+    mutate(label = paste0("R2=", signif(r2, 2), "\n", "p=", signif(p_val, 2)))
+
+  p_ssgsea <- ggplot(plot_long, aes(x = ogn_conn, y = ssgsea, color = space)) +
+    geom_point(size = 2, alpha = 0.8) +
+    geom_smooth(method = "lm", se = FALSE) +
+    facet_wrap(~ geneset, scales = "free_y") +
+    geom_text(
+      data = stats_tbl,
+      aes(x = Inf, y = Inf, label = label),
+      inherit.aes = FALSE,
+      hjust = 1.1,
+      vjust = 1.1,
+      size = 3
+    ) +
+    theme_bw() +
+    labs(title = "ssGSEA vs conectividade de OGN", x = "Conectividade OGN", y = "ssGSEA")
+
+  p_ssgsea
+}
 ```
 
 ### Exercicios (Dia 4)
