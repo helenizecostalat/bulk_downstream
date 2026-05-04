@@ -1,0 +1,871 @@
+---
+title: "RNAseq - Downstream course"
+author: "Diego M. Coelho"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+editor: visual
+---
+
+## Bulk RNAseq - Downstream course (PT-BR)
+
+### Objetivo
+
+Curso pratico para analisar RNA-seq bulk com foco em QC, DE, enriquecimento funcional, PPI, WGCNA e LIONESS. O fluxo usa o dataset GSE298393 (OSD-937) e ferramentas em R/Bioconductor.
+
+### Pre-requisitos
+
+-   Conceitos basicos de RNA-seq e expressao genica.
+-   R basico: vetores, data frames, funcoes.
+-   No computador: R \>= 4.3 e RStudio (ou VS Code + R).
+
+### Dataset
+
+-   Projeto: OSD-937 (GSE298393) - musculatura humana em condicoes de microgravidade.
+-   Paper: https://www.cell.com/stem-cell-reports/fulltext/S2213-6711(25)00154-7
+-   Arquivos principais:
+    -   `GSE298393/s_OSD-937.txt` (metadados)
+    -   `GSE298393/GLDS-765_rna_seq_STAR_Unnormalized_Counts_GLbulkRNAseq.csv` (contagens)
+
+### Agenda (5 dias)
+
+-   **Dia 1:** introducao + QC e exploracao inicial
+-   **Dia 2:** DE com DESeq2
+-   **Dia 3:** enriquecimento funcional + PPI
+-   **Dia 4:** WGCNA + LIONESS
+-   **Dia 5:** mini-projeto (entrega e apresentacao)
+
+------------------------------------------------------------------------
+
+## Setup
+
+```{r libraries}
+#| echo: false
+#| warning: false
+# Pacotes principais
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(DESeq2)
+library(matrixStats)
+library(pheatmap)
+library(tibble)
+library(ComplexHeatmap)
+library(circlize)
+library(RColorBrewer)
+```
+
+```{r import}
+# Metadados (GEO SOFT)
+meta <- read.table(
+  "GSE298393/s_OSD-937.txt",
+  sep = "\t",
+  fill = TRUE,
+  header = TRUE,
+  stringsAsFactors = FALSE
+)
+
+meta <- meta %>%
+  transmute(
+    sample = Sample.Name,
+    space = Factor.Value.Spaceflight.,
+    age = Factor.Value.Donor.Age.,
+    treatment = Factor.Value.Treatment.,
+    time = Factor.Value.Time.
+  )
+
+# Contagens (CSV de STAR)
+counts_raw <- read.csv(
+  "GSE298393/GLDS-765_rna_seq_STAR_Unnormalized_Counts_GLbulkRNAseq.csv",
+  header = TRUE,
+  check.names = FALSE
+)
+
+# Detecta coluna de genes (primeira coluna) e define rownames
+if (!is.numeric(counts_raw[[1]])) {
+  rownames(counts_raw) <- counts_raw[[1]]
+  counts_raw <- counts_raw[, -1]
+}
+
+# Mantem apenas amostras presentes nos metadados
+common_samples <- intersect(colnames(counts_raw), meta$sample)
+counts <- counts_raw[, common_samples, drop = FALSE]
+meta <- meta %>% filter(sample %in% common_samples)
+
+# Ordena meta para alinhar com as colunas
+meta <- meta %>% arrange(match(sample, colnames(counts)))
+
+stopifnot(all(meta$sample == colnames(counts)))
+```
+
+------------------------------------------------------------------------
+
+## Dia 1 - QC e exploracao
+
+### Objetivos
+
+-   Entender o desenho experimental e fatores.
+-   Checar qualidade basica de bibliotecas.
+-   Explorar variacao global (PCA/MDS).
+
+### QC basico
+
+```{r qc-basic}
+# Tamanho de biblioteca
+lib_size <- colSums(counts)
+qc_tbl <- meta %>%
+  mutate(lib_size = lib_size, genes_detected = colSums(counts > 0))
+
+p_lib <- ggplot(qc_tbl, aes(x = sample, y = lib_size, fill = space)) +
+  geom_col() +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Tamanho de biblioteca", y = "Reads", x = "")
+
+p_genes <- ggplot(qc_tbl, aes(x = sample, y = genes_detected, fill = space)) +
+  geom_col() +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Genes detectados", y = "Genes", x = "")
+
+p_lib
+p_genes
+```
+
+```{r qc-distribution}
+# Correlacao entre amostras (log1p)
+log_counts <- log1p(counts)
+sample_cor <- cor(log_counts, use = "pairwise.complete.obs")
+
+sample_cor <- sample_cor[meta$sample, meta$sample]
+
+anno_col <- data.frame(
+  time = factor(meta$time),
+  age = factor(meta$age),
+  space = factor(meta$space),
+  treatment = factor(meta$treatment),
+  row.names = meta$sample
+)
+
+time_levels <- levels(anno_col$time)
+age_levels <- levels(anno_col$age)
+space_levels <- levels(anno_col$space)
+treatment_levels <- levels(anno_col$treatment)
+
+time_cols <- setNames(colorRampPalette(brewer.pal(3, "Blues"))(length(time_levels)), time_levels)
+age_cols <- setNames(colorRampPalette(brewer.pal(3, "Greens"))(length(age_levels)), age_levels)
+space_cols <- setNames(colorRampPalette(brewer.pal(3, "Set1"))(length(space_levels)), space_levels)
+treat_cols <- setNames(colorRampPalette(brewer.pal(3, "Set2"))(length(treatment_levels)), treatment_levels)
+
+ha <- HeatmapAnnotation(
+  df = anno_col,
+  col = list(
+    time = time_cols,
+    age = age_cols,
+    space = space_cols,
+    treatment = treat_cols
+  ),
+  annotation_name_side = "left"
+)
+
+Heatmap(
+  sample_cor,
+  name = "cor",
+  top_annotation = ha,
+  col = colorRamp2(c(0.7, 0.85, 1), c("#2166AC", "#F7F7F7", "#B2182B")),
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  column_title = "Correlacao entre amostras"
+)
+```
+
+```{r qc-mad}
+# Variancia por amostra (VST)
+vsd_mad <- vst(DESeqDataSetFromMatrix(counts, meta, ~ 1))
+vst_mad_mat <- assay(vsd_mad)
+sample_var <- matrixStats::colVars(vst_mad_mat)
+mad_tbl <- meta %>% mutate(sample_var = sample_var)
+
+p_mad <- ggplot(mad_tbl, aes(x = sample, y = sample_var, fill = space)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  labs(title = "Variancia por amostra", y = "Variancia", x = "")
+
+p_mad
+```
+
+```{r qc-prepost}
+# Normalizacao (VST) para comparar distribuicoes
+vsd <- vst(DESeqDataSetFromMatrix(counts, meta, ~ 1))
+vst_mat <- assay(vsd)
+
+raw_tbl <- as.data.frame(log1p(counts)) %>%
+  pivot_longer(cols = everything(), names_to = "sample", values_to = "value") %>%
+  mutate(stage = "Pre-normalizacao")
+
+vst_tbl <- as.data.frame(vst_mat) %>%
+  pivot_longer(cols = everything(), names_to = "sample", values_to = "value") %>%
+  mutate(stage = "Pos-normalizacao (VST)")
+
+dist_tbl <- bind_rows(raw_tbl, vst_tbl) %>%
+  left_join(meta %>% select(sample, age), by = "sample")
+
+p_prepost <- ggplot(dist_tbl, aes(x = sample, y = value, color = age)) +
+  geom_boxplot(outlier.size = 0.3) +
+  facet_wrap(~ stage, ncol = 1, scales = "free_y") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  labs(title = "Distribuicao pre vs pos normalizacao", x = "Amostras", y = "Expressao")
+
+p_prepost
+```
+
+```{r qc-hclust}
+# Clustering hierarquico com top 500 genes por MAD
+gene_mad <- matrixStats::rowMads(vst_mat)
+top_idx <- order(gene_mad, decreasing = TRUE)[1:500]
+
+anno_col <- meta %>%
+  dplyr::select(space, age, treatment, time) %>%
+  as.data.frame()
+rownames(anno_col) <- meta$sample
+
+pheatmap::pheatmap(
+  vst_mat[top_idx, ],
+  show_rownames = FALSE,
+  annotation_col = anno_col,
+  clustering_distance_cols = "correlation",
+  main = "Clustering hierarquico (Top 500 MAD)"
+)
+```
+
+### PCA (variacao global)
+
+```{r qc-pca}
+# PCA usando VST
+pca <- prcomp(t(vst_mat))
+
+pca_tbl <- as.data.frame(pca$x) %>%
+  mutate(sample = rownames(pca$x)) %>%
+  left_join(meta, by = "sample")
+
+pca_tbl <- pca_tbl %>% mutate(time = factor(time))
+
+p_pca <- ggplot(pca_tbl, aes(x = PC1, y = PC2, color = space, shape = age)) +
+  geom_point(size = 3) +
+  theme_bw() +
+  labs(title = "PCA (VST)")
+
+p_pca2 <- ggplot(pca_tbl, aes(x = PC1, y = PC2, color = factor(time), shape = age)) +
+  geom_point(size = 3) +
+  theme_bw() +
+  labs(title = "PCA (VST)")
+
+cowplot::plot_grid(p_pca, p_pca2)
+```
+
+### Exercicios (Dia 1)
+
+1.  Identifique amostras com tamanho de biblioteca muito discrepante.
+2.  Compare a PCA colorindo por `treatment` e `time`.
+3.  Filtre genes com baixa expressao (ex.: soma \< 10) e refaca a PCA.
+
+### Gabarito (Dia 1)
+
+-   Amostras com `lib_size` muito baixo devem ser revisadas (possivel outlier).
+-   A PCA deve separar principalmente por `space` e/ou `treatment`.
+-   Filtrar genes baixos costuma reduzir ruido e melhorar separacao.
+
+------------------------------------------------------------------------
+
+## Dia 2 - Differential Expression (DESeq2)
+
+### Objetivos
+
+-   Montar um desenho experimental.
+-   Rodar DESeq2 e interpretar resultados.
+-   Gerar MA plot e volcano.
+
+### Setup DESeq2
+
+```{r deseq2-setup}
+# Exemplo de desenho: space + age + treatment
+meta <- meta %>%
+  mutate(
+    space = factor(space),
+    age = factor(age),
+    treatment = factor(treatment)
+  )
+
+dds <- DESeqDataSetFromMatrix(
+  countData = counts,
+  colData = meta,
+  design = ~ age + treatment + space
+)
+
+# Filtro basico
+dds <- dds[rowSums(counts(dds)) >= 10, ]
+
+dds <- DESeq(dds)
+```
+
+### Contraste e resultados
+
+```{r deseq2-results}
+res <- results(dds, contrast = c("space", "Space Flight", "Ground Control"))
+# apeglm requer uso de coef
+coef_name <- resultsNames(dds)[grepl("^space_", resultsNames(dds))][1]
+res <- lfcShrink(dds, coef = coef_name, type = "apeglm")
+
+res_tbl <- as.data.frame(res) %>%
+  rownames_to_column("gene") %>%
+  arrange(padj)
+
+head(res_tbl, 10)
+```
+
+### Comparacoes por idade e estimulo
+
+```{r deseq2-stratified}
+# Quatro comparacoes: Space Flight vs Ground Control dentro de cada grupo
+meta_group <- meta %>%
+  mutate(
+    group = paste(age, treatment, sep = " | "),
+    group = factor(
+      group,
+      levels = c(
+        "young | No Electric Stimulation",
+        "young | Electric Stimulation",
+        "old | No Electric Stimulation",
+        "old | Electric Stimulation"
+      )
+    )
+  )
+
+group_levels <- unique(meta_group$group)
+
+res_list <- lapply(group_levels, function(g) {
+  idx <- meta_group$group == g
+  dds_g <- DESeqDataSetFromMatrix(
+    countData = counts[, idx, drop = FALSE],
+    colData = meta_group[idx, ],
+    design = ~ space
+  )
+
+  dds_g <- dds_g[rowSums(counts(dds_g)) >= 10, ]
+  dds_g <- DESeq(dds_g)
+
+  res_g <- results(dds_g, contrast = c("space", "Space Flight", "Ground Control"))
+  coef_g <- resultsNames(dds_g)[grepl("^space_", resultsNames(dds_g))][1]
+  res_g <- lfcShrink(dds_g, coef = coef_g, type = "apeglm")
+
+  as.data.frame(res_g) %>%
+    rownames_to_column("gene") %>%
+    mutate(group = g)
+})
+
+res_group_tbl <- bind_rows(res_list)
+res_group_tbl %>%
+  group_by(group) %>%
+  arrange(padj) %>%
+  slice_head(n = 5)
+```
+
+### MA plot e volcano
+
+```{r deseq2-plots}
+plotMA(res, ylim = c(-4, 4))
+
+vol_tbl <- res_group_tbl %>%
+  filter(group == "old | No Electric Stimulation") %>%
+  mutate(sig = ifelse(padj < 0.05 & abs(log2FoldChange) > 1, "sig", "ns"))
+
+p_volcano <- ggplot(vol_tbl, aes(x = log2FoldChange, y = -log10(padj), color = sig)) +
+  geom_point(alpha = 0.6) +
+  theme_bw() +
+  labs(title = "Volcano plot")
+
+p_volcano
+```
+
+### Exercicios (Dia 2)
+
+1.  Troque o contraste para `treatment` (Electric Stimulation vs Controle).
+2.  Compare resultados com e sem shrinkage de LFC.
+3.  Gere uma tabela com top 20 genes e discuta biologicamente.
+
+### Gabarito (Dia 2)
+
+-   O contraste muda a interpretacao do LFC para o fator escolhido.
+-   Shrinkage reduz LFC extremos em genes com baixa contagem.
+-   Top genes devem ter padj \< 0.05 e \|LFC\| \> 1.
+
+------------------------------------------------------------------------
+
+## Dia 3 - Enriquecimento funcional + PPI
+
+### Objetivos
+
+-   Fazer ORA e GSEA com `clusterProfiler`.
+-   Construir rede PPI com STRING.
+-   Visualizar PPI usando `igraph` + `ggplot2`.
+
+### Enriquecimento (ORA)
+
+```{r enrichment-ora}
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+sig_genes <- res_group_tbl %>%
+  filter(padj < 0.05, abs(log2FoldChange) > log2(1.5), group == "old | No Electric Stimulation") %>%
+  pull(gene)
+
+# Converte para Entrez (IDs estao em ENSEMBL)
+sig_genes <- sub("\\..*$", "", sig_genes)
+entrez <- bitr(sig_genes, fromType = "ENSEMBL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+ego <- enrichGO(
+  gene = entrez$ENTREZID,
+  OrgDb = org.Hs.eg.db,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  readable = TRUE
+)
+
+dotplot(ego, showCategory = 15)
+```
+
+### Enriquecimento (GSEA)
+
+```{r enrichment-gsea}
+# Ranking por log2FoldChange do DESeq2
+rank_tbl <- res_group_tbl %>%
+  filter(group == "old | No Electric Stimulation") %>%
+  mutate(rank = -log10(pvalue)) %>%
+  arrange(desc(rank))
+
+rank_vec <- rank_tbl$rank
+names(rank_vec) <- rank_tbl$gene
+
+rank_vec <- sort(rank_vec, decreasing = TRUE)
+
+# Converte simbolos para Entrez
+rank_genes <- sub("\\..*$", "", names(rank_vec))
+rank_entrez <- bitr(rank_genes, fromType = "ENSEMBL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+rank_vec <- rank_vec[rank_entrez$ENSEMBL]
+
+names(rank_vec) <- rank_entrez$ENTREZID
+
+gsea <- gseGO(
+  geneList = rank_vec,
+  OrgDb = org.Hs.eg.db,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  verbose = FALSE
+)
+
+gsea_tbl <- as.data.frame(gsea)
+
+top_up <- gsea_tbl %>%
+  filter(NES > 0) %>%
+  arrange(desc(NES)) %>%
+  slice_head(n = 10)
+
+top_down <- gsea_tbl %>%
+  filter(NES < 0) %>%
+  arrange(NES) %>%
+  slice_head(n = 10)
+
+gsea_top <- bind_rows(top_up, top_down) %>%
+  mutate(Description = factor(Description, levels = Description[order(NES)]))
+
+p_gsea <- ggplot(gsea_top, aes(x = NES, y = Description, color = p.adjust, size = setSize)) +
+  geom_point() +
+  scale_color_viridis_c(option = "C") +
+  theme_bw() +
+  labs(title = "GSEA (Top 10 up/down)", y = NULL)
+
+p_gsea
+```
+
+### PPI com STRING + igraph
+
+```{r ppi-string}
+library(STRINGdb)
+library(igraph)
+
+string_db <- STRINGdb$new(version = "12.0", species = 9606, score_threshold = 700)
+
+# Mapeia genes significativos para STRING
+mapped <- string_db$map(data.frame(gene = sig_genes), "gene", removeUnmappedRows = TRUE)
+
+ppi <- string_db$get_interactions(mapped$STRING_id)
+
+# Grafo PPI
+g <- graph_from_data_frame(ppi[, c("from", "to")], directed = FALSE)
+```
+
+```{r ppi-ggplot}
+# Layout e tabela para ggplot2
+set.seed(123)
+coords <- layout_with_fr(g)
+
+node_tbl <- data.frame(
+  id = V(g)$name,
+  x = coords[, 1],
+  y = coords[, 2]
+)
+
+edge_tbl <- as.data.frame(get.edgelist(g))
+colnames(edge_tbl) <- c("from", "to")
+
+edge_tbl <- edge_tbl %>%
+  left_join(node_tbl, by = c("from" = "id")) %>%
+  rename(x1 = x, y1 = y) %>%
+  left_join(node_tbl, by = c("to" = "id")) %>%
+  rename(x2 = x, y2 = y)
+
+p_ppi <- ggplot() +
+  geom_segment(data = edge_tbl, aes(x = x1, y = y1, xend = x2, yend = y2), alpha = 0.2) +
+  geom_point(data = node_tbl, aes(x = x, y = y), size = 1.5) +
+  theme_void() +
+  labs(title = "PPI (STRING + igraph + ggplot2)")
+
+p_ppi
+```
+
+### Exercicios (Dia 3)
+
+1.  Compare ORA usando ontologias BP vs MF.
+2.  Aplique GSEA em um contraste diferente e compare termos.
+3.  Filtre a rede PPI por genes mais expressos e compare o numero de nos.
+
+### Gabarito (Dia 3)
+
+-   BP tende a termos biologicos amplos; MF mais funcoes especificas.
+-   GSEA muda conforme o ranking do contraste.
+-   Filtrar genes reduz nos e clareia a estrutura da rede.
+
+------------------------------------------------------------------------
+
+## Dia 4 - WGCNA + LIONESS
+
+### Objetivos
+
+-   Detectar modulos de coexpressao (WGCNA).
+-   Relacionar modulos com fenotipos.
+-   Estimar redes individuais com LIONESS.
+
+### WGCNA
+
+```{r wgcna}
+library(WGCNA)
+
+# Usa VST para reduzir efeitos de contagem
+vsd <- vst(dds)
+expr <- t(assay(vsd))
+
+# Escolha do soft-threshold
+powers <- 1:10
+sft <- pickSoftThreshold(expr, powerVector = powers, verbose = 0)
+
+# Exemplo com power recomendado
+soft_power <- sft$powerEstimate
+if (is.na(soft_power)) soft_power <- 6
+
+net <- blockwiseModules(
+  expr,
+  power = soft_power,
+  TOMType = "unsigned",
+  minModuleSize = 30,
+  mergeCutHeight = 0.25,
+  numericLabels = TRUE,
+  verbose = 0
+)
+
+module_eigengenes <- net$MEs
+```
+
+```{r wgcna-traits}
+# Relacao com fenotipos
+trait_tbl <- meta %>%
+  mutate(
+    space = factor(space),
+    age = factor(age),
+    treatment = factor(treatment),
+    time = factor(time)
+  )
+
+# Matriz de traits (dummy) para correlacao com modulos
+trait_mat <- model.matrix(~ space + age + treatment + time, data = trait_tbl)
+trait_mat <- trait_mat[, -1, drop = FALSE]
+
+module_trait_cor <- cor(module_eigengenes, trait_mat, use = "p")
+module_trait_p <- corPvalueStudent(module_trait_cor, nSamples = nrow(meta))
+
+# Heatmap de correlacao modulo x trait
+pheatmap::pheatmap(
+  module_trait_cor,
+  color = colorRampPalette(c("#2166AC", "#F7F7F7", "#B2182B"))(50),
+  display_numbers = TRUE,
+  number_format = "%.2f",
+  number_color = "black",
+  main = "WGCNA: Modulos vs Traits"
+)
+
+pheatmap::pheatmap(
+  -log10(module_trait_p),
+  color = colorRampPalette(c("#F7F7F7", "#FDB863", "#B2182B"))(50),
+  display_numbers = TRUE,
+  number_format = "%.1f",
+  number_color = "black",
+  main = "WGCNA: -log10(p)"
+)
+
+# Scatter de um trait continuo (time) com o modulo mais correlacionado
+if ("time" %in% colnames(trait_tbl)) {
+  me_names <- colnames(module_eigengenes)
+  cor_time <- module_trait_cor[, grepl("^time", colnames(module_trait_cor)), drop = FALSE]
+  top_mod <- rownames(cor_time)[which.max(abs(cor_time[, 1]))]
+
+  plot_tbl <- data.frame(
+    ME = module_eigengenes[, top_mod],
+    time = as.numeric(factor(trait_tbl$time))
+  )
+
+  p_scatter <- ggplot(plot_tbl, aes(x = time, y = ME)) +
+    geom_point(size = 2, alpha = 0.8) +
+    geom_smooth(method = "lm", se = FALSE, color = "#B2182B") +
+    theme_bw() +
+    labs(title = paste("Modulo", top_mod, "vs time"), x = "Time (ordinal)")
+
+  p_scatter
+}
+
+# Boxplot do modulo mais associado ao fator space
+if ("space" %in% colnames(trait_tbl)) {
+  cor_space <- module_trait_cor[, grepl("^space", colnames(module_trait_cor)), drop = FALSE]
+  top_mod_space <- rownames(cor_space)[which.max(abs(cor_space[, 1]))]
+
+  box_tbl <- data.frame(
+    ME = module_eigengenes[, top_mod_space],
+    space = trait_tbl$space
+  )
+
+  p_box <- ggplot(box_tbl, aes(x = space, y = ME, fill = space)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+    geom_jitter(width = 0.1, size = 1.5, alpha = 0.7) +
+    theme_bw() +
+    labs(title = paste("Modulo", top_mod_space, "por space"), x = NULL)
+
+  p_box
+}
+```
+
+### LIONESS
+
+```{r lioness}
+library(lionessR)
+library(SummarizedExperiment)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+
+# VST a partir do DESeq2
+vst_data <- vst(dds, blind = TRUE)
+normalized_counts <- assay(vst_data)
+
+# Mantem genes protein-coding
+clean_ids <- sub("\\..*$", "", rownames(normalized_counts))
+rownames(normalized_counts) <- clean_ids
+
+keys <- keys(org.Hs.eg.db, keytype = "ENSEMBL")
+gene_info <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = keys,
+  columns = c("ENSEMBL", "GENETYPE"),
+  keytype = "ENSEMBL"
+)
+
+protein_coding_genes <- gene_info$ENSEMBL[gene_info$GENETYPE == "protein-coding"]
+protein_coding_genes <- protein_coding_genes[!is.na(protein_coding_genes)]
+
+valid_genes <- intersect(rownames(normalized_counts), protein_coding_genes)
+normalized_counts <- normalized_counts[valid_genes, , drop = FALSE]
+
+# Top 2000 genes mais variaveis
+gene_var <- matrixStats::rowVars(normalized_counts)
+top_n <- min(2000, length(gene_var))
+top_idx <- order(gene_var, decreasing = TRUE)[1:top_n]
+expr_top <- normalized_counts[top_idx, , drop = FALSE]
+expr_top <- expr_top[, meta$sample, drop = FALSE]
+
+se_filtered <- SummarizedExperiment(
+  assays = list(counts = expr_top),
+  colData = DataFrame(sample = colnames(expr_top), row.names = colnames(expr_top)),
+  rowData = DataFrame(gene = rownames(expr_top), row.names = rownames(expr_top))
+)
+
+lioness_cor_optimized <- function(se) {
+  X <- assay(se)
+  n <- ncol(X)
+  S <- rowSums(X)
+  SS <- rowSums(X ^ 2)
+  SP <- X %*% t(X)
+
+  num_full <- SP - outer(S, S) / n
+  den_full <- sqrt((SS - S ^ 2 / n) %o% (SS - S ^ 2 / n))
+  C_full <- num_full / den_full
+
+  ut_idx <- which(upper.tri(C_full), arr.ind = TRUE)
+  genes <- rownames(X)
+  reg_names <- genes[ut_idx[, 1]]
+  tar_names <- genes[ut_idx[, 2]]
+  v_full <- C_full[ut_idx]
+
+  out <- matrix(NA_real_, nrow = length(reg_names), ncol = n)
+  colnames(out) <- colnames(X)
+
+  for (q in seq_len(n)) {
+    xq <- X[, q]
+    S_q <- S - xq
+    SS_q <- SS - xq ^ 2
+    SP_q <- SP - xq %*% t(xq)
+
+    num_q <- SP_q - outer(S_q, S_q) / (n - 1)
+    den_q <- sqrt((SS_q - S_q ^ 2 / (n - 1)) %o% (SS_q - S_q ^ 2 / (n - 1)))
+    C_q <- num_q / den_q
+
+    out[, q] <- n * (v_full - C_q[ut_idx]) + C_q[ut_idx]
+  }
+
+  list(W = out, reg = reg_names, tar = tar_names)
+}
+
+lioness_out <- lioness_cor_optimized(se_filtered)
+W <- lioness_out$W
+reg_names <- lioness_out$reg
+tar_names <- lioness_out$tar
+
+# Matriz de grau por gene e amostra (threshold mean + 2*sd)
+all_genes_in_network <- unique(c(reg_names, tar_names))
+
+deg_list <- lapply(seq_len(ncol(W)), function(i) {
+  col_w <- abs(W[, i])
+  thr <- mean(col_w, na.rm = TRUE) + (2 * sd(col_w, na.rm = TRUE))
+  keep <- !is.na(col_w) & col_w > thr
+
+  active_genes <- c(reg_names[keep], tar_names[keep])
+  gene_counts <- table(active_genes)
+
+  sample_deg <- setNames(integer(length(all_genes_in_network)), all_genes_in_network)
+  sample_deg[names(gene_counts)] <- as.integer(gene_counts)
+  sample_deg
+})
+
+deg_mat <- as.data.frame(do.call(cbind, deg_list))
+colnames(deg_mat) <- colnames(W)
+rownames(deg_mat) <- all_genes_in_network
+
+deg_mat[1:5, 1:5]
+```
+
+```{r lioness-digs}
+# DIGs: t-test nos graus por gene (Space Flight vs Ground Control)
+dig_meta <- meta %>%
+  mutate(group = paste(age, treatment, sep = " | ")) %>%
+  filter(group == "young | No Electric Stimulation")
+
+common_samples <- intersect(colnames(deg_mat), dig_meta$sample)
+deg_mat_sub <- deg_mat[, common_samples, drop = FALSE]
+dig_meta <- dig_meta %>%
+  filter(sample %in% common_samples) %>%
+  arrange(match(sample, common_samples))
+
+stopifnot(all(colnames(deg_mat_sub) == dig_meta$sample))
+
+sf_idx <- which(dig_meta$space == "Space Flight")
+gc_idx <- which(dig_meta$space == "Ground Control")
+
+dig_results_list <- lapply(seq_len(nrow(deg_mat_sub)), function(i) {
+  gene_name <- rownames(deg_mat_sub)[i]
+  deg_vec <- as.numeric(deg_mat_sub[i, ])
+
+  group_sf <- deg_vec[sf_idx]
+  group_gc <- deg_vec[gc_idx]
+
+  if (sd(group_sf) == 0 && sd(group_gc) == 0) return(NULL)
+
+  res <- tryCatch({
+    t_test <- t.test(group_sf, group_gc, alternative = "two.sided")
+    data.frame(
+      gene = gene_name,
+      mean_deg_sf = mean(group_sf),
+      mean_deg_gc = mean(group_gc),
+      diff_deg = mean(group_sf) - mean(group_gc),
+      p_val = t_test$p.value,
+      stringsAsFactors = FALSE
+    )
+  }, error = function(e) return(NULL))
+
+  res
+})
+
+dig_results <- bind_rows(dig_results_list) %>%
+  mutate(padj = p.adjust(p_val, method = "BH")) %>%
+  arrange(p_val)
+
+# Mapeia Ensembl -> simbolo
+gene_map <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = unique(dig_results$gene),
+  columns = c("ENSEMBL", "SYMBOL"),
+  keytype = "ENSEMBL"
+)
+
+dig_results <- dig_results %>%
+  left_join(gene_map, by = c("gene" = "ENSEMBL")) %>%
+  dplyr::rename(gene_symbol = SYMBOL)
+
+DIGs <- dig_results %>% filter(padj < 0.05)
+
+head(DIGs, 10)
+```
+
+### Exercicios (Dia 4)
+
+1.  Altere `minModuleSize` e compare o numero de modulos.
+2.  Relacione modulos com `treatment` e `age`.
+3.  Use LIONESS para comparar edges entre dois grupos.
+
+### Gabarito (Dia 4)
+
+-   `minModuleSize` menor gera mais modulos, possivelmente ruidosos.
+-   A correlacao com diferentes fenotipos pode mudar o modulo principal.
+-   Comparar edges exige resumir pesos por grupo (media ou teste).
+
+------------------------------------------------------------------------
+
+## Dia 5 - Mini-projeto
+
+### Entregas
+
+-   Definicao clara de pergunta biologica.
+-   Workflow completo: QC, DE, enriquecimento e uma rede (PPI ou WGCNA ou LIONESS).
+-   Relatorio em PDF/HTML com figuras e interpretacao.
+
+### Rubrica (resumo)
+
+-   Qualidade do QC e justificativas (20%).
+-   Corretude do DE e interpretacao (30%).
+-   Enriquecimento funcional e rede (30%).
+-   Clareza do relatorio e reproducibilidade (20%).
+
+### Sugestoes de temas
+
+-   Comparar Space Flight vs Ground Control em subgrupos (idade).
+-   Identificar modulos WGCNA associados ao tratamento.
+-   Analisar redes individuais com LIONESS por fenotipo.
