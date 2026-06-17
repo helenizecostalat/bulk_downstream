@@ -1,0 +1,1096 @@
+---
+title: "RNAseq - Downstream | Psoríase (GSE54456)"
+author: "Seu Nome"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-title: "Sumário"
+    code-fold: true
+    code-tools: true
+    theme: cosmo
+    highlight-style: github
+    embed-resources: true
+editor: visual
+---
+
+## Objetivo
+
+Reprodução do fluxo do curso *RNAseq Downstream* (Diego M. Coelho) aplicado ao dataset de **psoríase (GSE54456)**. O dataset contém amostras de pele lesionada (*lesional psoriatic skin*) e pele normal (*normal skin*).
+
+**Comparação principal:** Lesional Psoriatic Skin **vs** Normal Skin
+
+------------------------------------------------------------------------
+
+## Setup
+
+```{r libraries}
+#| echo: true
+#| warning: false
+#| message: false
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+library(stringr)
+library(tibble)
+
+library(DESeq2)
+library(matrixStats)
+
+library(ComplexHeatmap)
+library(circlize)
+library(RColorBrewer)
+library(pheatmap)
+
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(clusterProfiler)
+library(STRINGdb)
+library(igraph)
+#install.packages("WGCNA")
+library(WGCNA)
+library(lionessR)
+library(SummarizedExperiment)
+library(GSVA)
+library(msigdbr)
+
+library(cowplot)
+library(factoextra)
+library(cluster)
+```
+
+```{r import}
+#| warning: false
+#| message: false
+
+# --- Metadados ---
+meta_raw <- read.table(
+  "/Users/helenizecostalat/dicipline bulk/dados_clinicos_Psoriase.csv",
+  sep = ",", # Se for CSV real, mantenha vírgula
+  fill = TRUE,
+  header = TRUE,
+  stringsAsFactors = FALSE
+)
+
+meta <- meta_raw %>%
+  transmute(
+    sample    = as.character(.[[2]]),   # geo_accession (GSMxxxxx)
+    title     = as.character(.[[1]]),
+    condition = as.character(.[[37]])   # lesional psoriatic skin / normal skin
+  )
+
+# --- Contagens (TSV NCBI/STAR — Entrez IDs numéricos) ---
+counts_raw <- read.delim(
+  "/Users/helenizecostalat/dicipline bulk/GSE54456_raw_counts_GRCh38.p13_NCBI.tsv",
+  header      = TRUE,
+  check.names = FALSE
+)
+
+rownames(counts_raw) <- as.character(counts_raw$GeneID)
+counts_raw           <- counts_raw[, -1]
+
+# --- Sincronização ---
+common_samples <- intersect(colnames(counts_raw), meta$sample)
+
+if (length(common_samples) == 0) {
+  stop("ERRO: nenhuma amostra em comum. Verifique os IDs GSM.")
+}
+
+counts <- counts_raw[, common_samples, drop = FALSE]
+
+meta <- meta %>%
+  filter(sample %in% common_samples) %>%
+  arrange(match(sample, colnames(counts)))
+
+stopifnot(all(meta$sample == colnames(counts)))
+
+# Fatorar: referência = "normal skin"
+meta <- meta %>%
+  mutate(condition = factor(condition,
+                            levels = c("normal skin", "lesional psoriatic skin")))
+
+cat(sprintf("Amostras sincronizadas: %d\n", nrow(meta)))
+cat(sprintf("Genes na matriz:        %d\n", nrow(counts)))
+```
+
+------------------------------------------------------------------------
+
+## QC e Exploração
+
+### Objetivos
+
+-   Entender o desenho experimental (Lesional vs Normal).
+-   Checar qualidade básica das bibliotecas.
+-   Explorar variação global (correlação, clustering, PCA).
+
+### QC básico
+
+```{r qc-basic}
+#| fig-width: 12
+#| fig-height: 5
+#| warning: false
+
+lib_size    <- colSums(counts)
+genes_detec <- colSums(counts > 0)
+
+qc_tbl <- meta %>%
+  mutate(lib_size = lib_size, genes_detected = genes_detec)
+
+p_lib <- ggplot(qc_tbl, aes(x = sample, y = lib_size, fill = condition)) +
+  geom_col() +
+  scale_y_continuous(labels = comma) +
+  scale_fill_manual(values = c("normal skin"             = "#4393C3",
+                               "lesional psoriatic skin" = "#D6604D")) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 6)) +
+  labs(title = "Tamanho de Biblioteca", y = "Total de Reads", x = "", fill = "Grupo")
+
+p_genes <- ggplot(qc_tbl, aes(x = sample, y = genes_detected, fill = condition)) +
+  geom_col() +
+  scale_y_continuous(labels = comma) +
+  scale_fill_manual(values = c("normal skin"             = "#4393C3",
+                               "lesional psoriatic skin" = "#D6604D")) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 6)) +
+  labs(title = "Genes Detectados", y = "Genes (Counts > 0)", x = "", fill = "Grupo")
+
+cowplot::plot_grid(p_lib, p_genes, ncol = 2)
+```
+
+### Correlação entre amostras
+
+```{r qc-distribution}
+#| fig-width: 8
+#| fig-height: 7
+
+log_counts <- log1p(counts)
+sample_cor <- cor(log_counts, use = "pairwise.complete.obs")
+sample_cor <- sample_cor[meta$sample, meta$sample]
+
+anno_col <- data.frame(
+  Condicao  = factor(meta$condition),
+  row.names = meta$sample
+)
+
+cond_levels <- levels(anno_col$Condicao)
+cond_cols   <- setNames(c("#4393C3", "#D6604D"), cond_levels)
+
+ha_cor <- HeatmapAnnotation(
+  df  = anno_col,
+  col = list(Condicao = cond_cols),
+  annotation_name_side = "left"
+)
+
+Heatmap(
+  sample_cor,
+  name              = "Pearson\nCor",
+  top_annotation    = ha_cor,
+  col               = colorRamp2(c(0.8, 0.9, 1), c("#2166AC", "#F7F7F7", "#B2182B")),
+  show_row_names    = FALSE,
+  show_column_names = FALSE,
+  column_title      = "Correlação entre Amostras (GSE54456)",
+  clustering_distance_rows = "euclidean",
+  clustering_method_rows   = "complete"
+)
+```
+
+### Variância por amostra (VST)
+
+```{r qc-mad}
+#| fig-width: 8
+#| fig-height: 6
+#| warning: false
+#| message: false
+
+dds_qc <- DESeqDataSetFromMatrix(
+  countData = counts,
+  colData   = meta,
+  design    = ~ 1
+)
+dds_qc  <- dds_qc[rowSums(counts(dds_qc)) >= 10, ]
+vsd_qc  <- vst(dds_qc)
+vst_mat <- assay(vsd_qc)
+
+sample_var <- matrixStats::colVars(vst_mat)
+mad_tbl    <- meta %>% mutate(sample_var = sample_var)
+
+ggplot(mad_tbl, aes(x = sample, y = sample_var, fill = condition)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("normal skin"             = "#4393C3",
+                               "lesional psoriatic skin" = "#D6604D")) +
+  theme_bw() +
+  labs(title = "Variância por Amostra (VST)", y = "Variância", x = "")
+```
+
+### Distribuição pré vs pós normalização
+
+```{r qc-prepost}
+#| fig-width: 12
+#| fig-height: 8
+#| warning: false
+
+raw_tbl <- as.data.frame(log1p(counts)) %>%
+  pivot_longer(everything(), names_to = "sample", values_to = "value") %>%
+  mutate(stage = "Pré-normalização")
+
+vst_tbl_long <- as.data.frame(vst_mat) %>%
+  pivot_longer(everything(), names_to = "sample", values_to = "value") %>%
+  mutate(stage = "Pós-normalização (VST)")
+
+dist_tbl <- bind_rows(raw_tbl, vst_tbl_long) %>%
+  left_join(meta %>% select(sample, condition), by = "sample")
+
+ggplot(dist_tbl, aes(x = sample, y = value, color = condition)) +
+  geom_boxplot(outlier.size = 0.3) +
+  scale_color_manual(values = c("normal skin"             = "#4393C3",
+                                "lesional psoriatic skin" = "#D6604D")) +
+  facet_wrap(~ stage, ncol = 1, scales = "free_y") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 5),
+        legend.position = "none") +
+  labs(title = "Distribuição pré vs pós normalização (VST)", x = "", y = "Expressão")
+```
+
+### Clustering hierárquico — Top 500 MAD
+
+```{r qc-hclust}
+#| fig-width: 10
+#| fig-height: 8
+
+meta_sub <- df_subgrupos %>%
+  select(sample, Sub_Cluster, condition) %>%
+  mutate(Sub_Cluster = factor(Sub_Cluster,
+                              levels = c("Sub_1", "Sub_2")))
+
+gene_mad <- matrixStats::rowMads(vst_mat)
+top500   <- order(gene_mad, decreasing = TRUE)[1:500]
+
+anno_hclust <- meta %>%
+  select(condition) %>%
+  as.data.frame()
+rownames(anno_hclust) <- meta$sample
+
+pheatmap::pheatmap(
+  vst_mat[top500, ],
+  show_rownames            = FALSE,
+  annotation_col           = anno_hclust,
+  clustering_distance_cols = "correlation",
+  main                     = "Clustering Hierárquico — Top 500 MAD (GSE54456)"
+)
+```
+
+### Clustering grupo caso.
+
+```{r}
+#{r subcluster-casos}
+#| fig-width: 10
+#| fig-height: 8
+
+# --- Filtrar apenas os casos (lesional psoriatic skin) ---
+amostras_les <- meta_sub$sample[meta_sub$condition == "lesional psoriatic skin"]
+vst_les      <- vst_mat[, amostras_les]
+
+# O resto do código continua igual
+gene_mad_les <- matrixStats::rowMads(vst_les)
+top500_les   <- order(gene_mad_les, decreasing = TRUE)[1:500]
+matriz_zscore_les <- t(scale(t(vst_les[top500_les, ])))
+
+hcut_safe <- function(x, k, ...) {
+  if (k < 2) k <- 2
+  hcut(x, k = k, hc_method = "ward.D2", ...)
+}
+
+set.seed(42)
+p_elbow <- fviz_nbclust(t(matriz_zscore_les),
+                        FUN    = hcut_safe,
+                        method = "wss",
+                        k.max  = 8) +
+  labs(title = "Cotovelo — WSS (Lesional)") + theme_bw()
+
+p_sil <- fviz_nbclust(t(matriz_zscore_les),
+                      FUN    = hcut_safe,
+                      method = "silhouette",
+                      k.max  = 8) +
+  labs(title = "Silhueta — Coesão (Lesional)") + theme_bw()
+
+cowplot::plot_grid(p_elbow, p_sil, ncol = 2)
+```
+
+Para determinar o número ideal de subgrupos moleculares entre as amostras lesionadas, aplicamos os métodos Silhouette e Within-Cluster Sum of Squares (WSS). O coeficiente de silhueta indicou de forma robusta um pico de coesão e separação de agrupamento em k = 2, justificando a divisão das amostras em dois subgrupos principais (Sub_1 e Sub_2) para as análises subsequentes.
+
+```{r subcluster-df}
+
+df_subgrupos <- readRDS("/Users/helenizecostalat/dicipline bulk/df_subgrupos.rds")
+
+set.seed(42)
+k_escolhido <- 4
+
+hc_les <- hclust(dist(t(matriz_zscore_les)), method = "ward.D2")
+cluster_amostras <- cutree(hc_les, k = k_escolhido)
+
+# Adicionar ao meta_sub
+meta_sub$cluster4 <- factor(cluster_amostras[meta_sub$sample])
+
+# Checar distribuição
+table(meta_sub$cluster4, meta_sub$Sub_Cluster)
+
+```
+
+### DESeq - Cluster caso
+
+```{r}
+#| warning: false
+#| message: false
+
+
+# --- Adicionar cluster4 ao meta_sub ---
+set.seed(42)
+# Garantir que vst_mat tem as amostras de meta_sub
+amostras_les      <- meta_sub$sample[meta_sub$condition == "lesional psoriatic skin"]
+vst_les           <- vst_mat[, amostras_les]
+gene_mad_les      <- matrixStats::rowMads(vst_les)
+top500_les        <- order(gene_mad_les, decreasing = TRUE)[1:500]
+matriz_zscore_les <- t(scale(t(vst_les[top500_les, ])))
+
+hc_les            <- hclust(dist(t(matriz_zscore_les)), method = "ward.D2")
+cluster_amostras  <- cutree(hc_les, k = 4)
+
+meta_sub <- meta_sub %>%
+  mutate(cluster4 = factor(
+    cluster_amostras[sample],   # mapeia pelo nome da amostra
+    levels = 1:4,
+    labels = c("C1","C2","C3","C4")
+  ))
+
+# Checar distribuição antes de continuar
+cat("--- Distribuição cluster4 × Sub_Cluster ---\n")
+print(table(meta_sub$cluster4, meta_sub$Sub_Cluster))
+
+# --- Garantir que counts está na mesma ordem ---
+counts_sub <- counts[, meta_sub$sample, drop = FALSE]
+stopifnot(all(colnames(counts_sub) == meta_sub$sample))
+
+# --- DESeq2: Sub_2 vs Sub_1 ---
+dds_sub <- DESeqDataSetFromMatrix(
+  countData = counts_sub,
+  colData   = meta_sub,
+  design    = ~ Sub_Cluster
+)
+dds_sub <- dds_sub[rowSums(counts(dds_sub)) >= 10, ]
+dds_sub <- DESeq(dds_sub)
+coef_sub <- resultsNames(dds_sub)[grepl("^Sub_Cluster_", resultsNames(dds_sub))][1]
+res_sub  <- lfcShrink(dds_sub, coef = coef_sub, type = "apeglm")
+
+res_sub_tbl <- as.data.frame(res_sub) %>%
+  rownames_to_column("gene") %>%
+  mutate(
+    gene_symbol = mapIds(org.Hs.eg.db,
+                         keys      = gene,
+                         column    = "SYMBOL",
+                         keytype   = "ENTREZID",
+                         multiVals = "first")
+  ) %>%
+  arrange(padj)
+
+cat("--- Top 10 DEGs entre Sub_2 vs Sub_1 ---\n")
+print(head(res_sub_tbl %>% select(gene, gene_symbol, log2FoldChange, padj), 10))
+
+n_up   <- sum(res_sub_tbl$padj < 0.05 & res_sub_tbl$log2FoldChange >  1, na.rm = TRUE)
+n_down <- sum(res_sub_tbl$padj < 0.05 & res_sub_tbl$log2FoldChange < -1, na.rm = TRUE)
+cat(sprintf("\nDEGs: %d up em Sub_2 | %d down em Sub_2  (|LFC|>1, padj<0.05)\n",
+            n_up, n_down))
+```
+
+### PCA_SUBGRUPOS
+
+```{r}
+#{r subcluster-pca}
+#| fig-width: 7
+#| fig-height: 5
+
+pca_sub     <- prcomp(t(vst_les))
+pca_sub_tbl <- as.data.frame(pca_sub$x) %>%
+  rownames_to_column("sample") %>%
+  left_join(df_subgrupos %>% select(sample, Sub_Cluster), by = "sample")
+
+var_exp_sub <- round(100 * summary(pca_sub)$importance[2, 1:2], 1)
+
+ggplot(pca_sub_tbl, aes(x = PC1, y = PC2, color = Sub_Cluster)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Sub_1" = "#E69F00", "Sub_2" = "#56B4E9")) +
+  stat_ellipse(level = 0.95, linetype = "dashed") +
+  theme_bw() +
+  labs(title = "PCA — Subgrupos_Lesionada",
+       x = paste0("PC1 (", var_exp_sub[1], "%)"),
+       y = paste0("PC2 (", var_exp_sub[2], "%)"))
+```
+
+### Heatmap Subgrupo
+
+```{r}
+#{r subcluster-heatmap-degs}
+#| fig-width: 8
+#| fig-height: 7
+# 1. Filtrar DEGs
+degs_tbl <- res_sub_tbl %>% 
+  filter(padj < 0.05 & abs(log2FoldChange) > 1 & !is.na(padj)) %>%
+  mutate(label = coalesce(gene_symbol, gene))
+
+# 2. Matriz escalada
+mat_degs <- t(scale(t(vst_les[degs_tbl$gene, ])))
+rownames(mat_degs) <- degs_tbl$label
+
+# 3. Cluster4 alinhado às colunas da matriz
+cluster4_vec <- meta_sub$cluster4[match(colnames(mat_degs), meta_sub$sample)]
+
+# 4. Anotação com Subgrupo + Cluster4
+ha_degs <- HeatmapAnnotation(
+  Subgrupo = df_subgrupos$Sub_Cluster[match(colnames(mat_degs), df_subgrupos$sample)],
+  Cluster4 = cluster4_vec,
+  col = list(
+    Subgrupo = c("Sub_1" = "#E69F00", "Sub_2" = "#56B4E9"),
+    Cluster4 = c("C1" = "#1B9E77", "C2" = "#D95F02",
+                 "C3" = "#7570B3", "C4" = "#E7298A")
+  ),
+  annotation_name_side = "left"
+)
+
+# 5. Heatmap com coluna dividida em 4
+Heatmap(mat_degs,
+        name             = "Z-score",
+        top_annotation   = ha_degs,
+        column_split     = cluster4_vec,        # <-- divide em 4 grupos
+        column_title     = paste0("C", 1:4),
+        show_column_names = FALSE,
+        show_row_names   = FALSE,
+        col = colorRamp2(c(-2, 0, 2), c("#313695", "#FFFFBF", "#A50026")),
+        clustering_method_columns = "ward.D2",
+        clustering_method_rows    = "ward.D2",
+        cluster_column_slices     = FALSE)       # mantém ordem C1→C4
+```
+
+### PCA/Caso/controle
+
+```{r qc-pca}
+#| fig-width: 7
+#| fig-height: 5
+
+pca     <- prcomp(t(vst_mat))
+pca_tbl <- as.data.frame(pca$x) %>%
+  mutate(sample = rownames(pca$x)) %>%
+  left_join(meta, by = "sample")
+
+var_exp <- round(100 * summary(pca)$importance[2, 1:4], 1)
+
+ggplot(pca_tbl, aes(x = PC1, y = PC2, color = condition)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("normal skin"             = "#4393C3",
+                                "lesional psoriatic skin" = "#D6604D")) +
+  theme_bw() +
+  labs(title = "PCA (VST) — Psoríase GSE54456",
+       x     = paste0("PC1 (", var_exp[1], "%)"),
+       y     = paste0("PC2 (", var_exp[2], "%)"))
+```
+
+### Exercícios (Dia 1)
+
+1.  Identifique amostras com tamanho de biblioteca muito discrepante.
+2.  A PCA separa claramente os dois grupos? Discuta o que o PC1 captura.
+3.  Filtre genes com soma \< 10 e refaça a PCA — o padrão muda?
+
+------------------------------------------------------------------------
+
+### DESeq2
+
+```{r deseq2-setup}
+#| warning: false
+#| message: false
+
+meta <- meta %>%
+  mutate(condition = factor(condition,
+                            levels = c("normal skin", "lesional psoriatic skin")))
+
+dds <- DESeqDataSetFromMatrix(
+  countData = counts,
+  colData   = meta,
+  design    = ~ condition   # único fator: condição do tecido
+)
+
+dds <- dds[rowSums(counts(dds)) >= 10, ]
+dds <- DESeq(dds)
+```
+
+### Contraste e resultados
+
+```{r deseq2-results}
+#| warning: false
+
+coef_name <- resultsNames(dds)[grepl("^condition_", resultsNames(dds))][1]
+res       <- lfcShrink(dds, coef = coef_name, type = "apeglm")
+
+res_tbl <- as.data.frame(res) %>%
+  rownames_to_column("gene") %>%
+  arrange(padj)
+
+head(res_tbl, 10)
+```
+
+### MA plot e Volcano
+
+```{r deseq2-plots}
+#| fig-width: 12
+#| fig-height: 5
+
+# MA plot
+plotMA(res, ylim = c(-5, 5),
+       main = "MA plot — Lesional Psoriatic vs Normal Skin")
+
+# Volcano
+vol_tbl <- res_tbl %>%
+  filter(!is.na(padj)) %>%
+  mutate(sig = case_when(
+    padj < 0.05 & log2FoldChange >  1 ~ "Up (Lesional)",
+    padj < 0.05 & log2FoldChange < -1 ~ "Down (Lesional)",
+    TRUE                               ~ "ns"
+  ))
+
+n_up   <- sum(vol_tbl$sig == "Up (Lesional)")
+n_down <- sum(vol_tbl$sig == "Down (Lesional)")
+cat(sprintf("DEGs: %d up-regulados | %d down-regulados  (|LFC| > 1, padj < 0.05)\n",
+            n_up, n_down))
+
+ggplot(vol_tbl, aes(x = log2FoldChange, y = -log10(padj), color = sig)) +
+  geom_point(alpha = 0.5, size = 1) +
+  scale_color_manual(values = c("Up (Lesional)"   = "#D6604D",
+                                "Down (Lesional)" = "#4393C3",
+                                "ns"              = "grey70")) +
+  theme_bw() +
+  labs(title = "Volcano — Lesional Psoriatic vs Normal Skin",
+       x     = "log2 Fold Change",
+       y     = "-log10(padj)",
+       color = "")
+```
+
+### Exercícios (Dia 2)
+
+1.  Compare os resultados com e sem shrinkage de LFC (`apeglm`).
+2.  Gere uma tabela com os top 20 genes e anote seus símbolos.
+3.  Altere o threshold de \|LFC\| para 2 e veja como muda o número de DEGs.
+
+------------------------------------------------------------------------
+
+## Dia 3 — Enriquecimento Funcional + PPI
+
+### Objetivos
+
+-   Fazer ORA e GSEA com `clusterProfiler`.
+-   Construir rede PPI com STRING.
+-   Visualizar PPI com `igraph` + `ggplot2`.
+
+### ORA — GO:BP
+
+```{r enrichment-ora}
+#| warning: false
+#| message: false
+#| fig-width: 9
+#| fig-height: 7
+
+library(dplyr) # Or library(tidyverse)
+
+sig_entrez <- res_tbl %>%
+  filter(padj < 0.05, abs(log2FoldChange) > log2(1.5)) %>%
+  pull(gene) 
+
+ego <- enrichGO(
+  gene          = as.character(sig_entrez),
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  readable      = TRUE
+)
+
+dotplot(ego, showCategory = 15) +
+  labs(title = "ORA — GO:BP | Lesional_Normal")
+```
+
+### GSEA — GO:BP
+
+```{r enrichment-gsea}
+#| warning: false
+#| message: false
+#| fig-width: 9
+#| fig-height: 7
+
+rank_tbl <- res_tbl %>%
+  filter(!is.na(pvalue), !is.na(log2FoldChange)) %>%
+  mutate(rank_score = sign(log2FoldChange) * -log10(pvalue)) %>%
+  arrange(desc(rank_score))
+
+rank_vec <- setNames(rank_tbl$rank_score, as.character(rank_tbl$gene))
+rank_vec <- sort(rank_vec, decreasing = TRUE)
+rank_vec <- rank_vec[!duplicated(names(rank_vec))]
+
+# 1. Remover qualquer valor NA ou NaN do seu vetor
+rank_vec <- rank_vec[!is.na(rank_vec)]
+
+# 2. Identificar e tratar valores Infinitos (Inf e -Inf)
+# Uma abordagem comum é substituir o Infinito pelo maior/menor valor finito do seu vetor
+if (any(is.infinite(rank_vec))) {
+  max_finite <- max(rank_vec[is.finite(rank_vec)])
+  min_finite <- min(rank_vec[is.finite(rank_vec)])
+  
+  rank_vec[rank_vec == Inf] <- max_finite
+  rank_vec[rank_vec == -Inf] <- min_finite
+}
+
+# 3. Garantir que o vetor está perfeitamente ordenado de forma decrescente (obrigatório para o GSEA)
+rank_vec <- sort(rank_vec, decreasing = TRUE)
+
+gsea_res <- gseGO(
+  geneList      = rank_vec,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  verbose       = FALSE
+)
+
+gsea_tbl <- as.data.frame(gsea_res)
+
+if (nrow(gsea_tbl) > 0) {
+  gsea_top <- bind_rows(
+    gsea_tbl %>% filter(NES > 0) %>% arrange(desc(NES)) %>% slice_head(n = 10),
+    gsea_tbl %>% filter(NES < 0) %>% arrange(NES)       %>% slice_head(n = 10)
+  ) %>%
+    mutate(Description = factor(Description, levels = Description[order(NES)]))
+
+  ggplot(gsea_top, aes(x = NES, y = Description, color = p.adjust, size = setSize)) +
+    geom_point() +
+    scale_color_viridis_c(option = "C") +
+    theme_bw() +
+    labs(title = "GSEA — GO:BP | Lesional vs Normal (Top 10 up/down)", y = NULL)
+} else {
+  message("GSEA: nenhum termo significativo encontrado.")
+}
+```
+
+### PPI — STRING + igraphC
+
+```{r ppi-string}
+#| warning: false
+#| message: false
+#| 
+#BiocManager::install("STRINGdb")
+library(STRINGdb)
+library(org.Hs.eg.db)
+  
+string_db <- STRINGdb$new(version = "12.0", species = 9606, score_threshold = 900)
+
+sig_sym <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys    = as.character(sig_entrez),
+  columns = "SYMBOL",
+  keytype = "ENTREZID"
+) %>% filter(!is.na(SYMBOL))
+
+mapped <- string_db$map(
+  data.frame(gene = sig_sym$SYMBOL),
+  "gene",
+  removeUnmappedRows = TRUE
+)
+
+ppi <- string_db$get_interactions(mapped$STRING_id)
+```
+
+```{r ppi-ggplot}
+#| fig-width: 8
+#| fig-height: 8
+
+library(igraph)
+library(ggplot2)
+library(dplyr)
+library(ggraph)
+
+if (nrow(ppi) > 0) {
+  
+  # --- 1. Construir o grafo com STRING IDs ---
+  g_ppi <- graph_from_data_frame(ppi[, c("from", "to")], directed = FALSE)
+  g_ppi <- simplify(g_ppi)
+  
+  # --- 2. Substituir STRING IDs pelos símbolos dos genes ---
+  id_to_symbol <- setNames(mapped$gene, mapped$STRING_id)
+  V(g_ppi)$name <- ifelse(
+    V(g_ppi)$name %in% names(id_to_symbol),
+    id_to_symbol[V(g_ppi)$name],
+    V(g_ppi)$name
+  )
+  
+  # --- 3. Calcular grau ---
+  deg <- degree(g_ppi)
+  V(g_ppi)$degree <- deg
+  
+  # --- 4. Componente gigante ---
+  comps <- components(g_ppi)
+  giant <- induced_subgraph(g_ppi, which(comps$membership == which.max(comps$csize)))
+  
+  # --- 5. Top 30 genes mais conectados ---
+  top_n <- 100
+  hub_threshold <- sort(V(giant)$degree, decreasing = TRUE)[top_n]
+  hubs <- induced_subgraph(giant, which(V(giant)$degree >= hub_threshold))
+  hubs <- induced_subgraph(hubs, which(degree(hubs) > 0))  # remove isolados
+  
+  message("Hubs selecionados: ", vcount(hubs), " nos | threshold grau >= ", hub_threshold)
+  
+  # --- 6. Plot ---
+  set.seed(42)
+  
+  p <- ggraph(hubs, layout = "fr") +
+    
+    geom_edge_link0(alpha = 0.2, color = "grey60", width = 0.5) +
+    
+    geom_node_point(aes(size = degree, color = degree), alpha = 0.9) +
+    
+    geom_node_text(
+      aes(label = name),
+      size     = 4,
+      repel    = TRUE,
+      bg.color = alpha("white", 0.7),
+      bg.r     = 0.15
+    ) +
+    
+    scale_color_gradient(low = "#FDD0C0", high = "#B22222", name = "Grau") +
+    scale_size_continuous(range = c(4, 14), name = "Grau") +
+    
+    theme_void(base_size = 13) +
+    
+    labs(
+      title    = paste0("Hubs PPI \u2014 STRING (score \u2265 900)"),
+      caption  = "DEGs Psor\u00edase \u00b7 Layout Fruchterman-Reingold"
+    ) +
+    theme(
+      plot.title      = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle   = element_text(hjust = 0.5, color = "grey40"),
+      legend.position = "right"
+    )
+  
+  print(p)
+  
+} else {
+  message("Atencao: O data frame 'ppi' esta vazio. O grafo nao foi gerado.")
+}
+```
+
+### Exercícios (Dia 3)
+
+1.  Compare ORA usando as ontologias BP, MF e CC.
+2.  Aplique GSEA usando `gseKEGG` e compare os pathways com os do GO.
+3.  Filtre a rede PPI por hubs (grau \> percentil 90) e discuta os genes centrais.
+
+------------------------------------------------------------------------
+
+## Dia 4 — WGCNA + LIONESS
+
+### Objetivos
+
+-   Detectar módulos de coexpressão (WGCNA).
+-   Relacionar módulos com a condição (lesional vs normal).
+-   Estimar redes individuais por amostra com LIONESS.
+
+### WGCNA
+
+```{r wgcna}
+#| warning: false
+#| message: false
+
+vsd_wgcna  <- vst(dds)
+expr_wgcna <- t(assay(vsd_wgcna))   # amostras nas linhas
+
+powers <- 1:10
+sft    <- pickSoftThreshold(expr_wgcna, powerVector = powers, verbose = 0)
+
+soft_power <- sft$powerEstimate
+if (is.na(soft_power)) { soft_power <- 6; message("Usando soft_power = 6 (padrão).") }
+cat(sprintf("Soft-threshold selecionado: %d\n", soft_power))
+
+net <- blockwiseModules(
+  expr_wgcna,
+  power          = soft_power,
+  TOMType        = "unsigned",
+  minModuleSize  = 30,
+  mergeCutHeight = 0.25,
+  numericLabels  = TRUE,
+  verbose        = 0
+)
+
+module_eigengenes <- net$MEs
+cat(sprintf("Módulos encontrados: %d\n", ncol(module_eigengenes)))
+```
+
+```{r wgcna-traits}
+#| fig-width: 8
+#| fig-height: 6
+
+# --- CORREÇÃO: construir trait_mat alinhado aos rownames do module_eigengenes ---
+
+# 1. Subconjunto de meta com apenas as amostras presentes nos eigengenes
+amostras_wgcna <- rownames(module_eigengenes)  # GSM IDs que o WGCNA usou
+
+meta_wgcna <- meta %>%
+  filter(sample %in% amostras_wgcna) %>%
+  arrange(match(sample, amostras_wgcna))  # mesma ordem dos eigengenes
+
+# 2. Criar trait_mat com rownames = GSM IDs
+trait_mat <- model.matrix(~ condition, data = meta_wgcna)
+trait_mat <- trait_mat[, -1, drop = FALSE]
+colnames(trait_mat) <- "Lesional_vs_Normal"
+rownames(trait_mat) <- meta_wgcna$sample  # <-- CORREÇÃO PRINCIPAL
+
+# 3. Alinhar os dois objetos (garante ordem idêntica)
+amostras_comuns   <- intersect(rownames(module_eigengenes), rownames(trait_mat))
+me_alinhado       <- module_eigengenes[amostras_comuns, , drop = FALSE]
+trait_alinhado    <- trait_mat[amostras_comuns, , drop = FALSE]
+
+cat(sprintf("Amostras usadas na correlação: %d\n", length(amostras_comuns)))
+
+# 4. Correlação e p-valores
+module_trait_cor <- cor(me_alinhado, trait_alinhado, use = "pairwise.complete.obs")
+module_trait_p   <- corPvalueStudent(module_trait_cor, nSamples = length(amostras_comuns))
+
+# 5. Heatmaps
+pheatmap::pheatmap(
+  module_trait_cor,
+  color            = colorRampPalette(c("#2166AC", "#F7F7F7", "#B2182B"))(50),
+  display_numbers  = TRUE,
+  number_format    = "%.2f",
+  number_color     = "black",
+  cluster_cols     = FALSE,   # <-- CORREÇÃO: só 1 trait, não há o que clusterizar
+  main             = "WGCNA — Módulos × Condition (cor)"
+)
+
+pheatmap::pheatmap(
+  -log10(module_trait_p),
+  color            = colorRampPalette(c("#F7F7F7", "#FDB863", "#B2182B"))(50),
+  display_numbers  = TRUE,
+  number_format    = "%.1f",
+  number_color     = "black",
+  cluster_cols     = FALSE,   # <-- CORREÇÃO: idem
+  main             = "WGCNA — Módulos × Condition (-log10 p)"
+)
+# 6. Boxplot do módulo mais associado
+top_mod <- rownames(module_trait_cor)[which.max(abs(module_trait_cor[, 1]))]
+
+box_wgcna <- data.frame(
+  ME        = me_alinhado[, top_mod],
+  condition = meta_wgcna$condition[match(amostras_comuns, meta_wgcna$sample)]
+)
+
+ggplot(box_wgcna, aes(x = condition, y = ME, fill = condition)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(width = 0.1, size = 1.5, alpha = 0.7) +
+  scale_fill_manual(values = c("normal skin"             = "#4393C3",
+                               "lesional psoriatic skin" = "#D6604D")) +
+  theme_bw() +
+  labs(title = paste("WGCNA — Módulo", top_mod, "× Condition"), x = NULL, y = "Module Eigengene")
+```
+
+### LIONESS
+
+```{r lioness}
+#| warning: false
+#| message: false
+
+vst_lion    <- DESeq2::vst(dds, blind = TRUE)
+norm_counts <- assay(vst_lion)
+
+# Manter apenas protein-coding (Entrez IDs)
+gene_info <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys    = rownames(norm_counts),
+  columns = c("ENTREZID", "GENETYPE"),
+  keytype = "ENTREZID"
+)
+
+pc_genes    <- unique(gene_info$ENTREZID[gene_info$GENETYPE == "protein-coding" & !is.na(gene_info$GENETYPE)])
+valid_genes <- intersect(rownames(norm_counts), pc_genes)
+norm_counts <- norm_counts[valid_genes, , drop = FALSE]
+
+# CORREÇÃO: alinhar amostras entre norm_counts e meta
+amostras_lion <- intersect(colnames(norm_counts), meta$sample)
+norm_counts   <- norm_counts[, amostras_lion, drop = FALSE]
+
+meta_lion <- meta %>%
+  filter(sample %in% amostras_lion) %>%
+  arrange(match(sample, amostras_lion))
+
+cat(sprintf("Amostras no LIONESS: %d | Genes protein-coding: %d\n",
+            length(amostras_lion), nrow(norm_counts)))
+
+# Top 2000 genes mais variáveis
+gene_var <- matrixStats::rowVars(norm_counts)
+top2k    <- order(gene_var, decreasing = TRUE)[1:min(2000, length(gene_var))]
+expr_top <- norm_counts[top2k, , drop = FALSE]
+
+se_lion <- SummarizedExperiment(
+  assays  = list(counts = expr_top),
+  colData = DataFrame(sample    = colnames(expr_top),
+                      row.names = colnames(expr_top)),
+  rowData = DataFrame(gene      = rownames(expr_top),
+                      row.names = rownames(expr_top))
+)
+
+# Função LIONESS otimizada (leave-one-out correlação)
+lioness_cor_optimized <- function(se) {
+  X  <- assay(se); n <- ncol(X)
+  S  <- rowSums(X); SS <- rowSums(X ^ 2); SP <- X %*% t(X)
+
+  num_full <- SP - outer(S, S) / n
+  den_full <- sqrt((SS - S ^ 2 / n) %o% (SS - S ^ 2 / n))
+  C_full   <- num_full / den_full
+
+  ut_idx    <- which(upper.tri(C_full), arr.ind = TRUE)
+  genes     <- rownames(X)
+  reg_names <- genes[ut_idx[, 1]]
+  tar_names <- genes[ut_idx[, 2]]
+  v_full    <- C_full[ut_idx]
+
+  out <- matrix(NA_real_, nrow = length(reg_names), ncol = n)
+  colnames(out) <- colnames(X)
+
+  for (q in seq_len(n)) {
+    xq    <- X[, q]
+    S_q   <- S - xq
+    SS_q  <- SS - xq ^ 2
+    SP_q  <- SP - xq %*% t(xq)
+    num_q <- SP_q - outer(S_q, S_q) / (n - 1)
+    den_q <- sqrt((SS_q - S_q ^ 2 / (n - 1)) %o% (SS_q - S_q ^ 2 / (n - 1)))
+    C_q   <- num_q / den_q
+    out[, q] <- n * (v_full - C_q[ut_idx]) + C_q[ut_idx]
+  }
+
+  list(W = out, reg = reg_names, tar = tar_names)
+}
+
+cat("Rodando LIONESS (pode demorar alguns minutos)...\n")
+lioness_out <- lioness_cor_optimized(se_lion)
+
+W         <- lioness_out$W
+reg_names <- lioness_out$reg
+tar_names <- lioness_out$tar
+```
+
+```{r lioness-digs}
+#| fig-width: 9
+#| fig-height: 7
+#| warning: false
+
+all_genes <- unique(c(reg_names, tar_names))
+
+deg_list <- lapply(seq_len(ncol(W)), function(i) {
+  col_w <- abs(W[, i])
+  thr   <- mean(col_w, na.rm = TRUE) + 2 * sd(col_w, na.rm = TRUE)
+  keep  <- !is.na(col_w) & col_w > thr
+  gene_counts <- table(c(reg_names[keep], tar_names[keep]))
+  sample_deg  <- setNames(integer(length(all_genes)), all_genes)
+  sample_deg[names(gene_counts)] <- as.integer(gene_counts)
+  sample_deg
+})
+
+deg_mat <- as.data.frame(do.call(cbind, deg_list))
+colnames(deg_mat) <- colnames(W)
+rownames(deg_mat) <- all_genes
+
+# t-test grau: Lesional vs Normal
+common_dig  <- intersect(colnames(deg_mat), meta$sample)
+deg_mat_sub <- deg_mat[, common_dig, drop = FALSE]
+dig_meta    <- meta %>%
+  filter(sample %in% common_dig) %>%
+  arrange(match(sample, common_dig))
+
+les_idx <- which(dig_meta$condition == "lesional psoriatic skin")
+nor_idx <- which(dig_meta$condition == "normal skin")
+
+dig_results_list <- lapply(seq_len(nrow(deg_mat_sub)), function(i) {
+  g_name    <- rownames(deg_mat_sub)[i]
+  deg_vec   <- as.numeric(deg_mat_sub[i, ])
+  group_les <- deg_vec[les_idx]
+  group_nor <- deg_vec[nor_idx]
+  if (sd(group_les) == 0 && sd(group_nor) == 0) return(NULL)
+  tryCatch({
+    tt <- t.test(group_les, group_nor, alternative = "two.sided")
+    data.frame(gene = g_name,
+               mean_deg_les = mean(group_les), mean_deg_nor = mean(group_nor),
+               diff_deg = mean(group_les) - mean(group_nor),
+               p_val    = tt$p.value, stringsAsFactors = FALSE)
+  }, error = function(e) NULL)
+})
+
+dig_results <- bind_rows(dig_results_list) %>%
+  mutate(padj = p.adjust(p_val, method = "BH")) %>%
+  arrange(p_val)
+
+sym_map <- AnnotationDbi::select(org.Hs.eg.db,
+                                 keys    = unique(dig_results$gene),
+                                 columns = "SYMBOL",
+                                 keytype = "ENTREZID")
+
+dig_results <- dig_results %>%
+  left_join(sym_map, by = c("gene" = "ENTREZID")) %>%
+  dplyr::rename(gene_symbol = SYMBOL)
+
+DIGs <- dig_results %>% filter(padj < 0.05)
+cat(sprintf("DIGs significativos (padj < 0.05): %d\n", nrow(DIGs)))
+head(DIGs, 10)
+```
+
+```{r lioness-digs-plot}
+#| fig-width: 10
+#| fig-height: 6
+
+top_dig_genes <- DIGs %>% arrange(padj) %>% slice_head(n = 6) %>% pull(gene)
+
+if (length(top_dig_genes) > 0) {
+  gene_labels <- dig_results %>%
+    filter(gene %in% top_dig_genes) %>%
+    mutate(gene_label = ifelse(is.na(gene_symbol) | gene_symbol == "", gene, gene_symbol)) %>%
+    distinct(gene, gene_label)
+
+  plot_tbl_dig <- as.data.frame(t(deg_mat_sub[top_dig_genes, , drop = FALSE])) %>%
+    rownames_to_column("sample") %>%
+    pivot_longer(-sample, names_to = "gene", values_to = "degree") %>%
+    left_join(dig_meta %>% select(sample, condition), by = "sample") %>%
+    left_join(gene_labels, by = "gene")
+
+  ggplot(plot_tbl_dig, aes(x = condition, y = degree, fill = condition)) +
+    geom_boxplot(outlier.size = 0.6) +
+    geom_jitter(width = 0.1, size = 0.8, alpha = 0.6) +
+    scale_fill_manual(values = c("normal skin"             = "#4393C3",
+                                 "lesional psoriatic skin" = "#D6604D")) +
+    facet_wrap(~ gene_label, scales = "free_y") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 20, hjust = 1)) +
+    labs(title = "Top DIGs — Conectividade por Grupo (LIONESS)",
+         x = NULL, y = "Grau")
+}
+```
+
+### Exercícios (Dia 4)
+
+1.  Altere `minModuleSize` e compare o número de módulos gerados.
+2.  Relacione os módulos WGCNA com os genes DEGs do Dia 2.
+3.  Use LIONESS para comparar edges entre Lesional e Normal.
+
+------------------------------------------------------------------------
+
+```         
+```
+
+```         
+```
+
+```         
+```
